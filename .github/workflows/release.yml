@@ -1,0 +1,147 @@
+name: Build and Release Porter
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "porter-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver (e.g. 1.2.3)"
+        required: true
+        type: string
+
+jobs:
+  cargo-build-windows:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-gnu
+            arch: x64
+          - target: i686-pc-windows-gnu
+            arch: x86
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64 g++-mingw-w64-i686
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Add Rust Windows target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo folder
+        uses: ubicloud/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Cache sccache folder
+        uses: ubicloud/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-${{ matrix.target }}-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-${{ matrix.target }}-
+
+      - name: Build porter (Windows)
+        run: cargo build --release --bin porter --target ${{ matrix.target }}
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          CARGO_TARGET_I686_PC_WINDOWS_GNU_LINKER: i686-w64-mingw32-gcc
+
+      - name: Upload porter artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: porter-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/porter.exe
+
+  release:
+    runs-on: ubicloud-standard-2
+    needs: cargo-build-windows
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download porter x64
+        uses: actions/download-artifact@v4
+        with:
+          name: porter-x64
+          path: dist/x64
+
+      - name: Download porter x86
+        uses: actions/download-artifact@v4
+        with:
+          name: porter-x86
+          path: dist/x86
+
+      - name: Prepare release assets
+        run: |
+          set -eux
+          mkdir -p dist/out
+          cp dist/x64/porter.exe dist/out/porter-x64.exe
+          cp dist/x86/porter.exe dist/out/porter-x86.exe
+          ls -la dist/out
+
+      - name: Determine release tag
+        id: rel
+        shell: bash
+        run: |
+          set -eux
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=porter-${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/porter-* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            # Assume tag is a stable release unless it contains pre-release identifiers
+            if [[ "${GITHUB_REF_NAME}" =~ -(alpha|beta|rc|nightly) ]] || [[ "${GITHUB_REF_NAME}" =~ -[0-9]{8}-[a-f0-9]{7}$ ]]; then
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/heads/main ]]; then
+            # Create a nightly-style tag for main branch pushes
+            COMMIT_SHORT=$(git rev-parse --short HEAD)
+            DATE=$(date -u +%Y%m%d)
+            echo "tag=porter-$DATE-$COMMIT_SHORT" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.rel.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: Porter ${{ steps.rel.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          prerelease: ${{ steps.rel.outputs.prerelease }}
+          files: |
+            dist/out/*.exe
